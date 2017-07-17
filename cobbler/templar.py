@@ -32,6 +32,8 @@ import string
 jinja2_available = False
 try:
     import jinja2
+    from jinja2.ext import Extension
+    from jinja2 import nodes
     jinja2_available = True
 except:
     """ FIXME: log a message here """
@@ -44,6 +46,60 @@ import utils
 
 major, minor, release = Cheetah.Version.split('.')[0:3]
 fix_cheetah_class = int(major) >= 2 and int(minor) >= 4 and int(release) >= 2
+
+JINJA2_PLUGIN_DIR = '/etc/cobbler/jinja2_plugins'
+
+
+# Custom jinja2 extension to approximate 'snippet' in cheetah
+class SnippetExtension(Extension):
+    """
+    handle the {% snippet 'FOO' %} or {% SNIPPET 'foo' %} constructs
+    This is essentially a wrapper around 'include', but with a default
+    template to represent the 'cannot find template' issues.
+    """
+    tags = set(['snippet', 'SNIPPET'])
+
+    def __init__(self, environment):
+        """
+        setup the snippet
+        """
+        super(SnippetExtension, self).__init__(environment)
+
+    def parse(self, parser):
+        """
+        this part  triggered using a '{% snippet 'foo' %}
+        """
+        # records where we saw the tag
+        lineno = next(parser.stream).lineno
+
+        # behave like an {% include %} tag
+        node = jinja2.nodes.Include(lineno=lineno)
+        # extract the template name
+        targets = [ parser.parse_expression() ]
+        # append the 'cannot find template' error template. This must exist
+        targets.append(jinja2.nodes.Const('internal/template_missing.j2'))
+
+        node.template = jinja2.nodes.List(targets)
+        node.with_context = True
+        node.ignore_missing = False
+
+        return node
+
+class FilterExtension(Extension):
+    """
+    support custom jinja2 filters as well, loaded from /etc/cobbler/jinja2_plugins
+    """
+    sys.path.insert(0, JINJA2_PLUGIN_DIR)
+
+    def __init__(self, environment):
+        """register filters as a dict"""
+        super(FilterExtension, self).__init__(environment)
+        try:
+            from jinja_plugins import filters
+            fmod = filters.FilterPlugin()
+            self.environment.filters.update(fmod.filters())
+        except:
+            raise
 
 
 class Templar:
@@ -215,18 +271,44 @@ class Templar:
 
     def render_jinja2(self, raw_data, search_table, subject=None):
         """
-        Render data_input back into a file.
-        data_input is either a string or a filename
-        search_table is a dict of metadata keys and values
-        out_path if not-none writes the results to a file
+        Render raw_data back into a file.
+        :param raw_data: string or filename
+        :param search_table: a dict of metadata keys and values
+        :param out_path: if not-none writes the results to a file
         (though results are always returned)
-        subject is a profile or system object, if available (for snippet eval)
+        :param subject: a profile or system object, if available (for snippet eval)
         """
+        # totally rewritten to create a jinja2 environment with a FileSystemLoader
+
+        # build a snippet search path. This should be done somewhere else for both cheetah and jinja2
+        snipdir = search_table.get('snippetsdir')
+        template_search_path = [ snipdir ]
+        for snipclass in ('distro', 'profile', 'system'):
+            elem = search_table.get('%s_name' % snipclass)
+            if elem is not None:
+               # self.logger.info("%s | %s: %s" %(snipdir, snipclass, elem))
+                template_search_path.insert(0, "%s/per_%s/%s" % (snipdir, snipclass, elem))
+
+        # build a jinja2 environment to allow search paths
+        jinja_env = jinja2.Environment(
+            loader=jinja2.FileSystemLoader(template_search_path),
+            trim_blocks=True,
+            lstrip_blocks=True,
+            cache_size=0,
+            extensions=[SnippetExtension,FilterExtension],
+            )
+
 
         try:
-            template = jinja2.Template(raw_data)
+            if isinstance(raw_data, basestring):
+                template = jinja_env.from_string(raw_data)
+            else:
+                template = jinja_env.get_template(raw_data)
             data_out = template.render(search_table)
+        except jinja2.TemplateNotFound, T:
+            self.logger.warning("unable to find template")
+            data_out = "# unable to find template"
         except:
-            data_out = "# EXCEPTION OCCURRED DURING JINJA2 TEMPLATE PROCESSING\n"
+            raise
 
         return data_out
